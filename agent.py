@@ -38,6 +38,14 @@ async def test_mcp_stdio_server_tool(command: StrictMCPServerStdioParams) -> Any
 
 
 async def agent_main(token=None, repo=None, output_csv="mcp_repos.csv"):
+    try:
+        await asyncio.wait_for(_agent_main_inner(token, repo, output_csv), timeout=60)
+    except asyncio.TimeoutError:
+        print(f"Timeout: MCP server did not respond in time for repo {repo}. Skipping.")
+    except Exception as e:
+        print(f"Error in agent_main for repo {repo}: {e}")
+
+async def _agent_main_inner(token, repo, output_csv):
     async with MCPServerStdio(
         cache_tools_list=True,
         params={"command": "docker", "args":[
