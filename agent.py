@@ -109,6 +109,7 @@ async def main(num_repos=5, output_csv="mcp_repos.csv", token=None):
             print(f"Error processing repo {repo}: {e}")
             continue
     print(f"Wrote {count} rows to {output_csv}")
+    await asyncio.sleep(0.1)  # Give asyncio a moment to clean up subprocesses
 
 
 if __name__ == "__main__":
