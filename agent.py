@@ -1,85 +1,108 @@
-# agent.py - OpenAI agent SDK app to analyze MCP repos and output a CSV using the OpenAI Agents SDK
+# agent.py - Refactored to use GitHub Python API (PyGithub) to analyze MCP repos and output a CSV
+import os
 import asyncio
-import json
-from pydantic import BaseModel
-
-from agents import Agent, Runner, function_tool, ModelSettings
-from fetch_mcp_repos import process_all_repos
+from agents import Agent, Runner, function_tool
 from agents.mcp.server import MCPServerStdio
 from csv_utils import initialize_csv, append_rows
+from model import CSV_HEADERS, RepoFeatureRow, StrictMCPServerStdioParams
+from github_utils import search_github_repos_with_pagination
+from typing import Any
 
-CSV_HEADERS = [
-    "Repo Name",
-    "Docker",
-    "UVX",
-    "NPX",
-    "Filesystem Access",
-    "Credentials",
-    "Example Activation Command(s)",
-]
-
-
-class RepoFeatureRow(BaseModel):
-    repo_name: str
-    docker: str
-    uvx: str
-    npx: str
-    filesystem_access: str
-    credentials: str
-    example_activation_commands: str
-
-
-class FeatureExtractionOutput(BaseModel):
-    repo_name: str
-    docker: str
-    uvx: str
-    npx: str
-    filesystem_access: str
-    credentials: str
-    example_activation_commands: str
-
-
-feature_extraction_instructions = (
-    "You will be given a JSON object with keys: 'repo_id' (the MCP repo ID), and 'output_csv' (CSV path)."
-    " First, fetch full repository details by calling get_mcp_repo_tool(repo_id)."
-    " Then extract the following features from the repo dict:"
-    " repo_name (fullName), docker support (yes/no), uvx support (yes/no), npx support (yes/no), filesystem_access (yes/no), credentials (if any), example_activation_commands (if any, keep raw and one per line if more then one)."
-    " Finally, invoke append_rows(output_csv, [[repo_name, docker, uvx, npx, filesystem_access, credentials, example_activation_commands]])."
-    " Use only tool calls for side effects and return no extra text."
+feature_agent_instructions = (
+    "You are a GitHub repository feature extraction agent for Model Context Protocol (MCP) servers. "
+    "Your task is to analyze GitHub repositories and extract specific information for MCP servers."
+    "First use search_repositories for the specific repo to obtain the Repo object, it will have things like stars, forks, and license."
+    "Next get the ENTIRE README from the repo, DO NOT TRUNCATE AT ANY POINT!"
+    "Using the repo and readme data, determine if this is an MCP server, and not an MCP SDK, client, inspector, or hosting platform."
+    "If it is not an MCP server, return 'Not an MCP server'in the description. Be done, Do not Continue, leave the remaining fields blank."
+    "For an MCP server extract the repo url, name, description, readme, license."
+    "ONLY use the README to determine if the repo runs via Docker(Y/N), UVX(Y/N), NPX(Y/N), extract the commands to run the server."
+    "Determine if the MCP Server will require filesystem access(Y/N), and if it requires credentials."
+    "If MCP server is run Docker, UVX, NPX server, test the mcp stdio server and return the list of tools it supports. ONLY fill in tools list if successful otherwise leave blank."
 )
 
+@function_tool(strict_mode=False)
+async def test_mcp_stdio_server_tool(command: StrictMCPServerStdioParams) -> Any:
+    """
+    Test the command is a valid MCP server activation command.
+    Returns the list of tools that the MCP server supports.
 
-async def main(num_repos=20, output_csv="mcp_repos.csv"):
-    # Step 0: start the MCP server and keep it open
+    Args:
+        command: The object to start the server {"command": "uvx", "args": ["run", "--foo"], "env": {"FOO": "bar"}}
+    """
     async with MCPServerStdio(
-        params={"command": "python", "args": ["server.py"]},
-        name="Local MCP Server (stdio)",
-    ) as mcp_server:
-        # Initialize output CSV with headers before agent runs
-        initialize_csv(output_csv, CSV_HEADERS)
+        params=command.model_dump(),
+        client_session_timeout_seconds=10
+    ) as server:
+        return await server.list_tools()
 
-        # Create the feature extraction agent
+
+async def agent_main(token=None, repo=None, output_csv="mcp_repos.csv"):
+    async with MCPServerStdio(
+        cache_tools_list=True,
+        params={"command": "docker", "args":[
+            "run",
+            "-i",
+            "--rm",
+            "-e",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "-e",
+            "GITHUB_HOST",
+            "ghcr.io/github/github-mcp-server"
+        ], "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": token}
+        },
+        client_session_timeout_seconds=10
+    ) as server:
         feature_agent = Agent(
-            name="MCP Repo Feature Extractor",
-            instructions=feature_extraction_instructions,
+            name="GitHub Repo Search Agent",
+            instructions=feature_agent_instructions,
             model="gpt-4.1",
-            model_settings=ModelSettings(tool_choice="auto"),
-            tools=[append_rows],
-            mcp_servers=[mcp_server],
+            mcp_servers=[server],
+            tools=[
+                test_mcp_stdio_server_tool,
+            ],
+            output_type=RepoFeatureRow
         )
 
-        # Define a page handler to process each page of repos
-        async def handle_page(repos):
-            for repo in repos:
-                repo_id = repo.get("id")
-                print(f"Processing repo: {repo.get('fullName')} (ID={repo_id})")
-                payload = json.dumps({"repo_id": repo_id, "output_csv": output_csv})
-                await Runner.run(feature_agent, payload)
+        input = f"process the following GitHub repository: {repo}"
+        print(f"Processing {input}...")
 
-        # Use process_all_repos to iterate through pages and invoke feature agent
-        await process_all_repos(limit=num_repos, process_fn=handle_page)
-        print(f"Processed and appended repositories to {output_csv}")
+        repoFeatureRow = await Runner.run(feature_agent, input=input)
+        # Extract the actual RepoFeatureRow model from the RunResult
+        repo_feature_row = repoFeatureRow.final_output_as(RepoFeatureRow)
+        append_rows(output_csv, [repo_feature_row], headers=CSV_HEADERS)
+
+
+
+async def main(num_repos=5, output_csv="mcp_repos.csv", token=None):
+    if not token:
+        raise ValueError("GitHub token required")
+
+    query=Agent(name="GitHub Query Generator", 
+          instructions=(
+              "Generate a valid GitHub API search query string for search_repositories."
+              "Just the part that is the query like 'mcp in:name,description,readme model context protocol in:name,description,readme'"
+              "respond with exactly the query, nothing else."
+          )
+    )
+    query = await Runner.run(query, input="Generate a query to search GitHub repositories for Model Context Protocol (MCP) servers.")
+    print(f"Query: {query.final_output_as(str)}")
+    #query = 'mcp in:name,description,readme model context protocol in:name,description,readme'
+    repos_iter = search_github_repos_with_pagination(token, query.final_output_as(str), max_items=num_repos)
+    print(f"Processing up to {num_repos} repos.")
+
+    initialize_csv(output_csv, CSV_HEADERS)
+    count = 0
+    for repo in repos_iter:
+        try:
+            await agent_main(token=token, repo=repo, output_csv=output_csv)
+            count += 1
+        except Exception as e:
+            print(f"Error processing repo {repo}: {e}")
+            continue
+    print(f"Wrote {count} rows to {output_csv}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main(num_repos=144))
+    GH_TOKEN = os.getenv("GH_TOKEN")
+    asyncio.run(main(num_repos=100, token=GH_TOKEN))
