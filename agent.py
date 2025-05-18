@@ -18,7 +18,7 @@ feature_agent_instructions = (
     "For an MCP server extract the repo url, name, description, readme, license."
     "ONLY use the README to determine if the repo runs via Docker(Y/N), UVX(Y/N), NPX(Y/N), extract the commands to run the server."
     "Determine if the MCP Server will require filesystem access(Y/N), and if it requires credentials."
-    "If MCP server is run Docker, UVX, NPX server, test the mcp stdio server and return the list of tools it supports. ONLY fill in tools list if successful otherwise leave blank."
+    "If MCP server is run Docker, UVX, NPX server, test the mcp stdio server and return the list of tools it supports. ONLY fill in tools list if successful otherwise add the raw response message."
 )
 
 @function_tool(strict_mode=False)
@@ -114,4 +114,4 @@ async def main(num_repos=5, output_csv="mcp_repos.csv", token=None):
 
 if __name__ == "__main__":
     GH_TOKEN = os.getenv("GH_TOKEN")
-    asyncio.run(main(num_repos=100, token=GH_TOKEN))
+    asyncio.run(main(num_repos=50, token=GH_TOKEN))
